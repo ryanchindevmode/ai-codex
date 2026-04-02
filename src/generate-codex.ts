@@ -11,14 +11,14 @@
  *   npx ai-codex --output .claude/codex
  *   npx ai-codex --include src lib     # only scan these dirs
  *   npx ai-codex --exclude tests dist  # skip these dirs
- *   npx ai-codex --schema prisma/schema.prisma
+ *   npx ai-codex --schema path/to/schema.sql
  *
  * Config file (codex.config.json):
  *   {
  *     "output": ".ai-codex",
  *     "include": ["src", "lib", "app"],
  *     "exclude": ["tests", "__mocks__"],
- *     "schema": "prisma/schema.prisma"
+ *     "schema": "supabase/schema.sql"
  *   }
  */
 
@@ -106,7 +106,7 @@ Options:
   --output, -o <dir>    Output directory (default: .ai-codex)
   --include <dirs...>   Directories to scan (default: auto-detect)
   --exclude <dirs...>   Directories to skip
-  --schema <path>       Path to Prisma schema file (auto-detected)
+  --schema <path>       Path to SQL schema file (e.g. supabase/schema.sql)
   --version, -v         Show version
   --help, -h            Show this help
 
@@ -201,8 +201,8 @@ interface FrameworkInfo {
   appDir: string | null;
   libDirs: string[];
   componentDirs: string[];
-  hasPrisma: boolean;
-  prismaSchemaPath: string | null;
+  hasSchema: boolean;
+  schemaPath: string | null;
   skipDirs: Set<string>;
 }
 
@@ -212,8 +212,8 @@ function detectFramework(config: Config): FrameworkInfo {
     appDir: null,
     libDirs: [],
     componentDirs: [],
-    hasPrisma: false,
-    prismaSchemaPath: null,
+    hasSchema: false,
+    schemaPath: null,
     skipDirs: new Set(DEFAULT_SKIP_DIRS),
   };
 
@@ -232,15 +232,15 @@ function detectFramework(config: Config): FrameworkInfo {
     }
   }
 
-  // Detect Prisma
+  // Detect SQL schema
   const schemaCandidates = config.schema
     ? [config.schema]
-    : ['prisma/schema.prisma', 'schema.prisma', 'prisma/schema/schema.prisma'];
+    : ['supabase/schema.sql', 'schema.sql', 'db/schema.sql', 'sql/schema.sql'];
   for (const candidate of schemaCandidates) {
     const fullPath = path.resolve(ROOT, candidate);
     if (fs.existsSync(fullPath)) {
-      info.hasPrisma = true;
-      info.prismaSchemaPath = fullPath;
+      info.hasSchema = true;
+      info.schemaPath = fullPath;
       break;
     }
   }
@@ -633,20 +633,30 @@ function generateLib(framework: FrameworkInfo, config: Config): string | null {
 }
 
 // ---------------------------------------------------------------------------
-// 4. schema.md -- Database Schema (Prisma)
+// 4. schema.md -- Database Schema (SQL)
 // ---------------------------------------------------------------------------
 
 function generateSchema(framework: FrameworkInfo): string | null {
-  if (!framework.hasPrisma || !framework.prismaSchemaPath) return null;
+  if (!framework.hasSchema || !framework.schemaPath) return null;
 
-  const content = readFileSafe(framework.prismaSchemaPath);
+  const content = readFileSafe(framework.schemaPath);
   if (!content) return null;
 
   const SKIP_AUDIT_FIELDS = new Set([
-    'createdAt', 'updatedAt', 'deletedAt', 'isDeleted',
+    'created_at', 'updated_at', 'deleted_at', 'is_deleted',
+    'createdat', 'updatedat', 'deletedat', 'isdeleted',
   ]);
-  const PRISMA_SCALARS = new Set([
-    'String', 'Int', 'Float', 'Boolean', 'DateTime', 'Json', 'BigInt', 'Decimal', 'Bytes',
+
+  // SQL types that map to user-defined enums (not built-in)
+  const SQL_BUILTINS = new Set([
+    'int', 'integer', 'bigint', 'smallint', 'serial', 'bigserial',
+    'text', 'varchar', 'char', 'character varying', 'character',
+    'boolean', 'bool', 'float', 'double precision', 'real', 'numeric', 'decimal',
+    'timestamp', 'timestamptz', 'timestamp with time zone', 'timestamp without time zone',
+    'date', 'time', 'timetz', 'interval',
+    'json', 'jsonb', 'uuid', 'bytea', 'inet', 'cidr', 'macaddr',
+    'money', 'xml', 'point', 'line', 'lseg', 'box', 'path', 'polygon', 'circle',
+    'tsquery', 'tsvector', 'int4', 'int8', 'float4', 'float8', 'int2',
   ]);
 
   interface ModelField {
@@ -666,76 +676,162 @@ function generateSchema(framework: FrameworkInfo): string | null {
     relations: ModelRelation[];
   }
 
-  const lines = content.split('\n');
+  // Extract CREATE TABLE blocks
+  const tableRegex = /CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?:"?(\w+)"?\.)?"?(\w+)"?\s*\(([\s\S]*?)\);/gi;
   const models: ModelInfo[] = [];
-  let currentModel: ModelInfo | null = null;
-  let braceDepth = 0;
 
-  for (const line of lines) {
-    const trimmed = line.trim();
+  let tableMatch: RegExpExecArray | null;
+  while ((tableMatch = tableRegex.exec(content)) !== null) {
+    const tableName = tableMatch[2];
+    const tableBody = tableMatch[3];
 
-    const modelStart = trimmed.match(/^model\s+(\w+)\s*\{/);
-    if (modelStart) {
-      currentModel = { name: modelStart[1], fields: [], relations: [] };
-      braceDepth = 1;
-      continue;
+    const model: ModelInfo = { name: tableName, fields: [], relations: [] };
+
+    // Split on commas, but respect parentheses nesting
+    const columnDefs: string[] = [];
+    let depth = 0;
+    let current = '';
+    for (const ch of tableBody) {
+      if (ch === '(') depth++;
+      if (ch === ')') depth--;
+      if (ch === ',' && depth === 0) {
+        columnDefs.push(current.trim());
+        current = '';
+      } else {
+        current += ch;
+      }
+    }
+    if (current.trim()) columnDefs.push(current.trim());
+
+    // Track table-level constraints for multi-column PKs and UNIQUEs
+    const tablePKColumns = new Set<string>();
+    const tableUQColumns = new Set<string>();
+
+    for (const def of columnDefs) {
+      const trimmed = def.trim();
+      if (!trimmed) continue;
+
+      // Table-level PRIMARY KEY
+      const tablePKMatch = trimmed.match(/^PRIMARY\s+KEY\s*\(([^)]+)\)/i);
+      if (tablePKMatch) {
+        const cols = tablePKMatch[1].split(',').map((c) => c.trim().replace(/"/g, ''));
+        cols.forEach((c) => tablePKColumns.add(c));
+        continue;
+      }
+
+      // Table-level UNIQUE
+      const tableUQMatch = trimmed.match(/^UNIQUE\s*\(([^)]+)\)/i);
+      if (tableUQMatch) {
+        const cols = tableUQMatch[1].split(',').map((c) => c.trim().replace(/"/g, ''));
+        cols.forEach((c) => tableUQColumns.add(c));
+        continue;
+      }
+
+      // FOREIGN KEY ... REFERENCES
+      const tableFKMatch = trimmed.match(/^(?:CONSTRAINT\s+\w+\s+)?FOREIGN\s+KEY\s*\("?(\w+)"?\)\s*REFERENCES\s+"?(\w+)"?/i);
+      if (tableFKMatch) {
+        model.relations.push({ fieldName: tableFKMatch[1], target: tableFKMatch[2], isArray: false });
+        continue;
+      }
+
+      // Skip other constraints (CHECK, CONSTRAINT, etc.)
+      if (/^(?:CONSTRAINT|CHECK|EXCLUDE)\b/i.test(trimmed)) continue;
+
+      // Column definition: column_name type ...
+      const colMatch = trimmed.match(/^"?(\w+)"?\s+([\w\s()]+?)(?:\s+(?:NOT\s+NULL|NULL|DEFAULT|PRIMARY|UNIQUE|REFERENCES|CHECK|CONSTRAINT|GENERATED|COLLATE)\b|\s*$)/i);
+      if (!colMatch) {
+        // Simpler fallback: just name and type
+        const simpleMatch = trimmed.match(/^"?(\w+)"?\s+(\w+)/);
+        if (!simpleMatch) continue;
+        const colName = simpleMatch[1];
+        const colType = simpleMatch[2].toLowerCase();
+
+        if (SKIP_AUDIT_FIELDS.has(colName.toLowerCase())) continue;
+
+        const isPK = /PRIMARY\s+KEY/i.test(trimmed);
+        const isUnique = /\bUNIQUE\b/i.test(trimmed);
+        const isFK = /\bREFERENCES\b/i.test(trimmed);
+        const isEnum = !SQL_BUILTINS.has(colType);
+
+        if (!isPK && !isUnique && !isFK && !isEnum) continue;
+
+        const flags: string[] = [];
+        if (isPK) flags.push('PK');
+        if (isUnique) flags.push('UQ');
+
+        // Extract FK reference
+        if (isFK) {
+          const refMatch = trimmed.match(/REFERENCES\s+"?(\w+)"?/i);
+          if (refMatch) {
+            model.relations.push({ fieldName: colName, target: refMatch[1], isArray: false });
+          }
+        }
+
+        model.fields.push({ name: colName, type: colType, flags, comment: '' });
+        continue;
+      }
+
+      const colName = colMatch[1];
+      let colType = colMatch[2].trim().toLowerCase();
+      // Normalize common type variations
+      colType = colType.replace(/\(\d+\)/g, '').trim(); // strip (255) etc.
+
+      const isPK = /PRIMARY\s+KEY/i.test(trimmed);
+      const isUnique = /\bUNIQUE\b/i.test(trimmed);
+      const isFK = /\bREFERENCES\b/i.test(trimmed);
+      const baseType = colType.split(/\s/)[0]; // first word of type
+      const isEnum = !SQL_BUILTINS.has(baseType) && !SQL_BUILTINS.has(colType);
+
+      // Extract inline comment
+      let comment = '';
+      const commentMatch = trimmed.match(/--\s*(.+)/);
+      if (commentMatch) comment = commentMatch[1].trim();
+
+      // Extract FK reference
+      if (isFK) {
+        const refMatch = trimmed.match(/REFERENCES\s+"?(\w+)"?/i);
+        if (refMatch) {
+          model.relations.push({ fieldName: colName, target: refMatch[1], isArray: false });
+        }
+      }
+
+      if (SKIP_AUDIT_FIELDS.has(colName.toLowerCase()) && !isPK && !isUnique) continue;
+
+      const isKey = isPK || isUnique || isEnum;
+      const isFKLike = /_id$/i.test(colName) && colName.toLowerCase() !== 'id';
+
+      if (!isKey && !isFKLike && !isFK) continue;
+
+      const flags: string[] = [];
+      if (isPK) flags.push('PK');
+      if (isUnique) flags.push('UQ');
+
+      model.fields.push({ name: colName, type: baseType, flags, comment });
     }
 
-    if (!currentModel) continue;
-
-    for (const ch of trimmed) {
-      if (ch === '{') braceDepth++;
-      if (ch === '}') braceDepth--;
+    // Apply table-level PK/UQ constraints to fields
+    for (const f of model.fields) {
+      if (tablePKColumns.has(f.name) && !f.flags.includes('PK')) f.flags.unshift('PK');
+      if (tableUQColumns.has(f.name) && !f.flags.includes('UQ')) f.flags.push('UQ');
     }
 
-    if (braceDepth <= 0) {
-      models.push(currentModel);
-      currentModel = null;
-      continue;
+    // If table-level PK references columns not yet in fields, add them
+    for (const pkCol of tablePKColumns) {
+      if (!model.fields.some((f) => f.name === pkCol)) {
+        model.fields.unshift({ name: pkCol, type: '', flags: ['PK'], comment: '' });
+      }
     }
 
-    if (!trimmed || trimmed.startsWith('//') || trimmed.startsWith('@@')) continue;
-
-    const fieldMatch = trimmed.match(/^(\w+)\s+([\w\[\]?]+)/);
-    if (!fieldMatch) continue;
-
-    const fieldName = fieldMatch[1];
-    const fieldType = fieldMatch[2];
-
-    const isRelation = /\@relation\(/.test(trimmed);
-    const isArray = fieldType.endsWith('[]');
-    const baseType = fieldType.replace('[]', '').replace('?', '');
-
-    if (isRelation || (isArray && /^[A-Z]/.test(baseType))) {
-      currentModel.relations.push({ fieldName, target: baseType, isArray });
-      continue;
-    }
-
-    const isPK = /@id\b/.test(trimmed);
-    const isUnique = /@unique\b/.test(trimmed);
-    const isEnum = /^[A-Z]/.test(baseType) && !PRISMA_SCALARS.has(baseType);
-
-    if (SKIP_AUDIT_FIELDS.has(fieldName) && !isPK && !isUnique) continue;
-
-    const isKey = isPK || isUnique || isEnum;
-    const isFKLike = /Id$|_id$/i.test(fieldName) && fieldName !== 'id';
-
-    if (!isKey && !isFKLike) continue;
-
-    const flags: string[] = [];
-    if (isPK) flags.push('PK');
-    if (isUnique) flags.push('UQ');
-
-    let comment = '';
-    const commentMatch = trimmed.match(/\/\/\s*(.+)/);
-    if (commentMatch) comment = commentMatch[1].trim();
-
-    currentModel.fields.push({ name: fieldName, type: fieldType.replace('?', ''), flags, comment });
+    models.push(model);
   }
+
+  if (models.length === 0) return null;
+
+  // --- Output compression (same logic as original) ---
 
   const output: string[] = [
     `# Database Schema (generated ${TODAY})`,
-    `# ${models.length} models. PK=primary key, UQ=unique. Only key/FK/enum fields shown.`,
+    `# ${models.length} tables. PK=primary key, UQ=unique. Only key/FK/enum fields shown.`,
     '',
   ];
 
@@ -945,7 +1041,7 @@ function main() {
   }
   console.log(`  Framework:  ${framework.name}`);
   console.log(`  Output:     ${config.output}/`);
-  if (framework.hasPrisma) console.log(`  Prisma:     ${path.relative(ROOT, framework.prismaSchemaPath!)}`);
+  if (framework.hasSchema) console.log(`  Schema:     ${path.relative(ROOT, framework.schemaPath!)}`);
   console.log('');
 
   const outputDir = path.resolve(ROOT, config.output);
